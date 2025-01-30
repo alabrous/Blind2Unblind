@@ -34,6 +34,7 @@ parser.add_argument('--save_model_path', type=str,
 parser.add_argument('--log_name', type=str,
                     default='b2u_unet_gauss25_112rf20')
 parser.add_argument('--gpu_devices', default='0', type=str)
+parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'])
 parser.add_argument('--parallel', action='store_true')
 parser.add_argument('--n_feature', type=int, default=48)
 parser.add_argument('--n_channel', type=int, default=3)
@@ -54,6 +55,13 @@ operation_seed_counter = 0
 os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_devices
 torch.set_num_threads(6)
 
+if opt.device == 'cuda' and torch.cuda.is_available():
+    device = torch.device('cuda')
+elif opt.device == 'mps' and torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+
 # config loggers. Before it, the log will not work
 opt.save_path = os.path.join(opt.save_model_path, opt.log_name, systime)
 os.makedirs(opt.save_path, exist_ok=True)
@@ -66,7 +74,6 @@ util.setup_logger(
     tofile=True,
 )
 logger = logging.getLogger("train")
-
 
 def save_network(network, epoch, name):
     save_path = os.path.join(opt.save_path, 'models')
@@ -130,12 +137,12 @@ def checkpoint(net, epoch, name):
     print('Checkpoint saved to {}'.format(save_model_path))
 
 
-def get_generator():
+def get_generator(device):
     global operation_seed_counter
     operation_seed_counter += 1
-    g_cuda_generator = torch.Generator(device="cuda")
-    g_cuda_generator.manual_seed(operation_seed_counter)
-    return g_cuda_generator
+    g_generator = torch.Generator(device=device)
+    g_generator.manual_seed(operation_seed_counter)
+    return g_generator
 
 
 class AugmentNoise(object):
@@ -163,7 +170,7 @@ class AugmentNoise(object):
         if self.style == "gauss_fix":
             std = self.params[0]
             std = std * torch.ones((shape[0], 1, 1, 1), device=x.device)
-            noise = torch.cuda.FloatTensor(shape, device=x.device)
+            noise = torch.empty(shape, device=x.device)
             torch.normal(mean=0.0,
                          std=std,
                          generator=get_generator(),
@@ -173,7 +180,7 @@ class AugmentNoise(object):
             min_std, max_std = self.params
             std = torch.rand(size=(shape[0], 1, 1, 1),
                              device=x.device) * (max_std - min_std) + min_std
-            noise = torch.cuda.FloatTensor(shape, device=x.device)
+            noise = torch.empty(shape, device=x.device)
             torch.normal(mean=0, std=std, generator=get_generator(), out=noise)
             return x + noise
         elif self.style == "poisson_fix":
@@ -527,7 +534,7 @@ network = UNet(in_channels=opt.n_channel,
                 wf=opt.n_feature)
 if opt.parallel:
     network = torch.nn.DataParallel(network)
-network = network.cuda()
+network = network.to(device)
 
 # about training scheme
 num_epoch = opt.n_epoch
@@ -585,7 +592,7 @@ for epoch in range(epoch_init, opt.n_epoch + 1):
     for iteration, clean in enumerate(TrainingLoader):
         st = time.time()
         clean = clean / 255.0
-        clean = clean.cuda()
+        clean = clean.to(device)
         noisy = noise_adder.add_train_noise(clean)
 
         optimizer.zero_grad()
@@ -670,7 +677,7 @@ for epoch in range(epoch_init, opt.n_epoch + 1):
                     transformer = transforms.Compose([transforms.ToTensor()])
                     noisy_im = transformer(noisy_im)
                     noisy_im = torch.unsqueeze(noisy_im, 0)
-                    noisy_im = noisy_im.cuda()
+                    noisy_im = noisy_im.to(device)
                     with torch.no_grad():
                         n, c, h, w = noisy_im.shape
                         net_input, mask = masker.train(noisy_im)
@@ -679,7 +686,10 @@ for epoch in range(epoch_init, opt.n_epoch + 1):
                         dn_output = noisy_output.detach().clone()
                         # Release gpu memory
                         del net_input, mask, noisy_output
-                        torch.cuda.empty_cache()
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        elif device.type == 'mps':
+                            torch.mps.empty_cache()
                         exp_output = network(noisy_im)
                     pred_dn = dn_output[:, :, :H, :W]
                     pred_exp = exp_output.detach().clone()[:, :, :H, :W]
@@ -687,7 +697,10 @@ for epoch in range(epoch_init, opt.n_epoch + 1):
 
                     # Release gpu memory
                     del exp_output
-                    torch.cuda.empty_cache()
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    elif device.type == 'mps':
+                        torch.mps.empty_cache()
 
                     pred_dn = pred_dn.permute(0, 2, 3, 1)
                     pred_exp = pred_exp.permute(0, 2, 3, 1)
